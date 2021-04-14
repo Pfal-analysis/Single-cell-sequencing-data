@@ -1,0 +1,363 @@
+#paired read fastq files are named as sample_name_1.fastq.gz and sample_name_2.fastq.gz
+
+
+#Reorder reads and remove singletons using BBMap repair.sh
+repair.sh in1=sample_name_1.fastq.gz in2=sample_name_2.fastq.gz out1=sample_namefixed_1.fastq.gz out2=sample_namefixed_2.fastq.gz outs=sample_namesingletons.fastq.gz
+
+
+#interleave reads and verify naming using BBMap reformat.sh, addslash = adding /1 or /2 for respective reads to show pairing, spaceslash = add a space in between for/rev /1, trimreaddes=remove trailing information after spaces, verifypaired = quick check to make sure that all reads have a mate and have a readable header name, Xmx6g = use 6Gb of RAM for this operation, tune to computer/operations
+reformat.sh in=sample_namefixed_1.fastq.gz in2=sample_namefixed_2.fastq.gz out=sample_nameraw.fastq.gz addslash=t spaceslash=f trimreaddescription=t verifypaired=t Xmx6g
+
+
+#remove adapters and Phix reads using BBMap bbduk.sh
+#no need to remove phix reads, because they do not have index
+#remove adapters and clean reads, ref = specify the files with adapter sequences, may want to rerun with ktrim=l as well (left end), "k" specifies the kmer size to use (must be at most the length of the adapters) while "mink" allows it to use shorter kmers at the ends of the read (for example, k=11 for the last 11 bases). "hdist" means "hamming distance"; this allows one mismatch. 
+bbduk.sh in=sample_nameraw.fastq.gz out=sample_nameclean.fastq.gz ref=/path/adapters.fa ktrim=r k=23 mink=11 hdist=1 tpe tbo
+
+
+#trim MALBAC primer using BBMap bbduk.sh
+#ADD MALBAC COMMON SEQUENCE TO THE ADAPTER FILE (GTG AGT GAT GGT TGA GGT AGT GTG GAG)
+bbduk.sh in=sample_nameclean.fastq.gz out=sample_nameclean2.fastq.gz ref=/path/adapters.fa ktrim=l k=23 mink=11 hdist=1 tpe tbo
+
+
+#double check whether primer are removed completely
+
+
+#subsample 10,000 reads for Blast using BBMap reformat.sh
+reformat.sh in=sample_nameclean2.fastq out=sample_nameclean2.downsampled10000.fastq samplereadstarget=5000 int=t sampleseed=42 
+
+#covert fastq to fasta
+sed -n '1~4s/^@/>/p;2~4p' sample_nameclean2.downsampled10000.fastq > sample_nameclean2.downsampled10000.fasta
+
+
+#Blast+ remote
+blastn -db nt -query sample_nameclean2.downsampled10000.fasta -remote -max_target_seqs 1 -max_hsps 1 -out sample_nameclean2.downsampled10000.blast.output -evalue 1e-10 -outfmt '6 qseqid sseqid pident evalue staxids sscinames scomnames sskingdoms stitle'
+
+
+#align reads to hg19 human reference genome
+speedseq align -p -v -t 16 -o sample_name_hg19_align -M 4 -R "@RG\tID:sample_name\tSM:sample_name\tLB:lib" hg19.fa.gz sample_nameclean2.fastq.gz
+
+
+#keep unmapped reads using samtools
+##1.An unmapped read whose mate is mapped.
+##2.A mapped read who’s mate is unmapped
+##3.Both reads of the pair are unmapped
+samtools view -u  -f 4 -F 264 sample_name_hg19_align.bam  > sample_name_unmapped1.bam
+samtools view -u -f 8 -F 260 sample_name_hg19_align.bam  > sample_name_unmapped2.bam
+samtools view -u -f 12 -F 256 sample_name_hg19_align.bam > sample_name_unmapped3.bam
+##merge, sort unmapped bam
+samtools merge -u - sample_name_unmapped[123].bam | samtools sort -n - unmapped > sample_name_unmapped.sorted.bam   
+#convert bam to fastq, check reads pair
+samtools fastq -1 sample_name_hgunmapped_1.fastq -2 sample_name_hgunmapped_2.fastq -s singleton.fastq sample_name_unmapped.sorted.bam  
+
+
+#mapping reads to 3D7 reference genome
+speedseq align -v -t 16 -o sample_name_3D7_align -M 4 -R "@RG\tID:sample_name_\tSM:sample_name_\tLB:lib" PlasmoDB-42_Pfalciparum3D7_Genome.fasta sample_name_hgunmapped_1.fastq sample_name_hgunmapped_2.fastq
+
+
+#discard low-quality reads (q10), and duplicated reads by samtools
+##sort bam
+samtools sort sample_name_3D7_align.bam > sample_name_3D7_align.sorted.bam
+##filter by q10
+samtools view -q 10 -b sample_name_3D7_align.sorted.bam > sample_name_3D7_align.sorted.q10.bam
+##remove duplicate
+samtools view -bF 0x400 sample_name_3D7_align.sorted.q10.bam > sample_name_3D7_align.sorted.q10.nodup.bam
+##filter by q30
+samtools view -b -q 30 sample_name_3D7_align.sorted.q10.nodup.bam > sample_name_3D7_align.sorted.q30.nodup.bam
+samtools index sample_name_3D7_align.sorted.q30.nodup.bam
+
+
+#downsample mappable reads to the same number of reads, re-align to 3D7 genome
+samtools bam2fq sample_name_3D7_align.sorted.q10.nodup.bam > sample_name_3D7_align.sorted.q10.nodup.fastq
+cat sample_name_3D7_align.sorted.q10.nodup.fastq | paste - - - - | sort -k1,1 -t " " | tr "\t" "\n" > sample_name_3D7_align.sorted.q10.nodup.sorted.fastq
+reformat.sh in=sample_name_3D7_align.sorted.q10.nodup.sorted.fastq out=sample_name_3D7_align.sorted.q10.nodup.sorted.downsampled300000.fastq samplereadstarget=150000 int=t sampleseed=42 
+speedseq align -p -v -t 16 -o sample_name_downsampled_3D7_align -M 4 -R "@RG\tID:sample_name_\tSM:sample_name_\tLB:lib" PlasmoDB-42_Pfalciparum3D7_Genome.fasta sample_name_3D7_align.sorted.q10.nodup.sorted.downsampled300000.fastq
+#sort the bam file as above
+
+
+#Calculate coverage by Qualimap, input.txt file include the list of file to be analyzed, path and group
+qualimap multi-bamqc -d /path/input.txt -outdir /output_path/ -r 
+#Calculate coverage by Qualimap for genic or intergenic region
+qualimap multi-bamqc -d /path/input.txt -outdir /output_path/ -r -gff /path/bedfile
+
+
+#keep the MALBAC common primers in the sequencing reads, filtered reads and aligned reads as in the above analysis. We subsetted BAM files for genic and intergenic regions using Bedtools, searched for the MALBAC common primer sequence using Samtools, and counted reads with MALBAC common primer using the pileup tool in BBMap
+##subsetted BAM files for genic and intergenic regions using Bedtools 
+##genic
+intersectBed -abam sameple_name_bamfile -b Pf3d7_genicinfo.bed > sameple_name_genic.bam
+##intergenic
+intersectBed -abam sameple_name_bamfile -b Pf3d7_intergenicinfo.bed > sameple_name_intergenic.bam
+
+##searched for the MALBAC common primer sequence using Samtools
+##genic
+samtools view -h sameple_name_genic.bam | grep '@\|GTGAGTGATGGTTGAGGTAGTGTGGAG\|CTCCACACTACCTCAACCATCACTCAC' > sameple_name_genic_malprimer.sam
+##intergenic
+samtools view -h sameple_name_intergenic.bam | grep '@\|GTGAGTGATGGTTGAGGTAGTGTGGAG\|CTCCACACTACCTCAACCATCACTCAC' > sameple_name_intergenic_malprimer.sam
+##whole genome
+samtools view -h sameple_name_bamfile | grep '@\|GTGAGTGATGGTTGAGGTAGTGTGGAG\|CTCCACACTACCTCAACCATCACTCAC' > sameple_name_malprimer.sam
+
+##counted reads with MALBAC common primer using the pileup tool in BBMap
+##genic
+pileup.sh in=sameple_name_genic_malprimer.sam out=sameple_name_genic_malprimer.txt rpkm=rpkm.sameple_name_genic_malprimer.txt
+##intergenic
+pileup.sh in=sameple_name_intergenic_malprimer.sam out=sameple_name_intergenic_malprimer.txt rpkm=rpkm.sameple_name_intergenic_malprimer.txt
+##whole genome
+pileup.sh in=sameple_name_malprimer.sam out=sameple_name_malprimer.txt rpkm=rpkm.sameple_name_malprimer.txt
+
+
+#calculate GC content% of all 5 bases sequences in the genome
+#create 5 bases windows, sliding by 1 base (change bed file for genic and intergenic regions)
+bedtools makewindows -b Pf3d7total.bed.txt -w 5 -s 1 > 3d7.5basewindow.bed
+#filter out windows smaller than 5 bases
+awk '($3-$2) >= 5' 3d7.5basewindow.bed > 3d7.5basewindow.corrected.bed
+#calculate gc content
+bedtools nuc -fi PlasmoDB-42_Pfalciparum3D7_Genome.fasta -bed 3d7.5basewindow.corrected.bed | cut -f 1-3,5 > 3d7.5basewindow.corrected.bed.gc
+
+
+#single cell sequencing analysis
+
+#Divide genome into equal-sized windows using Bedtools, calculate coverage and GC content of sequence in each window
+##create genome size file for Bedtools to make windows
+awk -v OFS='\t' {'print $1,$2'} PlasmoDB-42_Pfalciparum3D7_Genome.fasta.fai > PlasmoDB42_3d7_genomeFile.txt
+##create windows
+bedtools makewindows -g PlasmoDB42_3d7_genomeFile.txt -w 1000 > PlasmoDB42.1Kb.bed
+bedtools makewindows -g PlasmoDB42_3d7_genomeFile.txt -w 2000 > PlasmoDB42.2Kb.bed
+bedtools makewindows -g PlasmoDB42_3d7_genomeFile.txt -w 3000 > PlasmoDB42.3Kb.bed
+bedtools makewindows -g PlasmoDB42_3d7_genomeFile.txt -w 4000 > PlasmoDB42.4Kb.bed
+bedtools makewindows -g PlasmoDB42_3d7_genomeFile.txt -w 5000 > PlasmoDB42.5Kb.bed
+bedtools makewindows -g PlasmoDB42_3d7_genomeFile.txt -w 6000 > PlasmoDB42.6Kb.bed
+bedtools makewindows -g PlasmoDB42_3d7_genomeFile.txt -w 7000 > PlasmoDB42.7Kb.bed
+bedtools makewindows -g PlasmoDB42_3d7_genomeFile.txt -w 8000 > PlasmoDB42.8Kb.bed
+bedtools makewindows -g PlasmoDB42_3d7_genomeFile.txt -w 9000 > PlasmoDB42.9Kb.bed
+bedtools makewindows -g PlasmoDB42_3d7_genomeFile.txt -w 10000 > PlasmoDB42.10Kb.bed
+bedtools makewindows -g PlasmoDB42_3d7_genomeFile.txt -w 20000 > PlasmoDB42.20Kb.bed
+bedtools makewindows -g PlasmoDB42_3d7_genomeFile.txt -w 30000 > PlasmoDB42.30Kb.bed
+##Calculate GC in each window
+bedtools nuc -fi PlasmoDB-42_Pfalciparum3D7_Genome.fasta -bed PlasmoDB42.1Kb.bed > PlasmoDB42.1KbGC.bed
+bedtools nuc -fi PlasmoDB-42_Pfalciparum3D7_Genome.fasta -bed PlasmoDB42.2Kb.bed > PlasmoDB42.2KbGC.bed
+bedtools nuc -fi PlasmoDB-42_Pfalciparum3D7_Genome.fasta -bed PlasmoDB42.3Kb.bed > PlasmoDB42.3KbGC.bed
+bedtools nuc -fi PlasmoDB-42_Pfalciparum3D7_Genome.fasta -bed PlasmoDB42.4Kb.bed > PlasmoDB42.4KbGC.bed
+bedtools nuc -fi PlasmoDB-42_Pfalciparum3D7_Genome.fasta -bed PlasmoDB42.5Kb.bed > PlasmoDB42.5KbGC.bed
+bedtools nuc -fi PlasmoDB-42_Pfalciparum3D7_Genome.fasta -bed PlasmoDB42.6Kb.bed > PlasmoDB42.6KbGC.bed
+bedtools nuc -fi PlasmoDB-42_Pfalciparum3D7_Genome.fasta -bed PlasmoDB42.7Kb.bed > PlasmoDB42.7KbGC.bed
+bedtools nuc -fi PlasmoDB-42_Pfalciparum3D7_Genome.fasta -bed PlasmoDB42.8Kb.bed > PlasmoDB42.8KbGC.bed
+bedtools nuc -fi PlasmoDB-42_Pfalciparum3D7_Genome.fasta -bed PlasmoDB42.9Kb.bed > PlasmoDB42.9KbGC.bed
+bedtools nuc -fi PlasmoDB-42_Pfalciparum3D7_Genome.fasta -bed PlasmoDB42.10Kb.bed > PlasmoDB42.10KbGC.bed
+bedtools nuc -fi PlasmoDB-42_Pfalciparum3D7_Genome.fasta -bed PlasmoDB42.20Kb.bed > PlasmoDB42.20KbGC.bed
+bedtools nuc -fi PlasmoDB-42_Pfalciparum3D7_Genome.fasta -bed PlasmoDB42.30Kb.bed > PlasmoDB42.30KbGC.bed
+##Create coverage bed files for all window sizes, here shows the command for 20kb window
+bedtools coverage -a PlasmoDB42.20Kb.bed -b sample_name.sorted.bam -counts -sorted >  sample_name.20kcov.bed
+
+#combine files (sample_name.20kb.bed) of samples into one file (Bins_20kbdata.txt)
+#read Bins_20kbdata.txt file into R
+#R scripts
+Bins_20kbdata <- read.table(file = '/path/Bins_20kbdata.txt', sep = "", header = FALSE)
+DF<-Bins_20kbdata
+library("data.table")
+##set up column name to sample name
+setnames(DF,old=c("Cell7"),new=c("Bulk"))
+setnames(DF,old=c("Cell1","Cell19","Cell20","Cell21","Cell22","Cell23","Cell24","Cell25","Cell26","Cell27","Cell28","Cell29","Cell30"),new=c("EOM1","EOM19","EOM20","EOM21","EOM22","EOM23","EOM24","EOM25","EOM26","EOM27","EOM28","EOM29","EOM30"))
+setnames(DF,old=c("Cell4","Cell5","Cell11","Cell12","Cell13","Cell14","Cell15","Cell16","Cell17","Cell18"),new=c("LOM4","LOM5","LOM11","LOM12","LOM13","LOM14","LOM15","LOM16","LOM17","LOM18"))
+setnames(DF,old=c("Cell2","Cell3"),new=c("LNM2","ENM3"))
+setnames(DF,old=c("Cell8","Cell10"),new=c("COM1","COM2"))
+
+#R scripts
+##normalize reads:the mapped reads of each bin divided by the total average reads in each sample
+DF_normalized<-t(t(DF)/colMeans(DF))
+
+#R scripts
+##assess uniformity of amplification, we calculated the coefficient of variation of normalized read abundance by dividing the standard deviation by the mean and multiplying by 100
+##reshape
+library(dplyr)
+library(tidyr)
+DF_reshape <- 
+  DF_normalized %>%
+  gather(variable, value) %>% 
+  na.omit
+##calculate coefficient of variation of each sample
+CV <- function(x){
+  (sd(x)/mean(x))*100
+}
+DF_cv<-aggregate(value ~ variable, 
+                data = DF_reshape,
+                FUN = CV)
+
+#R scripts
+##analyze the equality of coefficients of variation using the R package “cvequality” version 0.2.0
+##generate pairs of data
+write.table(outer(DF_cv$variable, DF_cv$variable, paste, sep=","), "/path/DF_cv", row.names=F, col.names=F, sep = "  ")
+
+#R scripts
+#Asymptotic test for the equality of coefficients of variation
+library(cvequality)
+out <- DF_reshape[DF_reshape$variable %in% c("LOM4","LOM5","LOM11","LOM12","LOM13","LOM14","LOM15","LOM16","LOM17","LOM18"), ]
+cv_test1 <- 
+  with(out, 
+       asymptotic_test(value, 
+                       variable))
+
+out <- DF_reshape[DF_reshape$variable %in% c("EOM1","EOM19","EOM20","EOM21","EOM22","EOM23","EOM24","EOM25","EOM26","EOM27","EOM28","EOM29","EOM30"), ]
+cv_test2 <- 
+  with(out, 
+       asymptotic_test(value, 
+                       variable))
+
+out <- DF_reshape[DF_reshape$variable %in% c("LOM18","LNM2"), ]
+cv_test3 <- 
+  with(out, 
+       asymptotic_test(value, 
+                       variable))
+
+#R scripts
+##Spearman correlation of normalized read abundance. removed outlier bins if their read abundance was above the highest point of the upper whisker (Q3 + 1.5×interquartile range) or below the lowest point of the lower whisker (Q1-1.5×interquartile range) in each sample. 
+library("data.table")
+DF2<-cbind(DF,row.names(DF))
+setnames(DF2,old="row.names(DF)",new="index")
+#remove outliers in each cells (here shows Cell7 and Cell2)
+Q <- quantile(DF$Cell7, probs=c(.25, .75), na.rm = FALSE)
+iqr <- IQR(DF$Cell7)
+up <- Q[2]+1.5*iqr # Upper Range
+low<- Q[1]-1.5*iqr # Lower Range
+Cell7_eliminated<- subset(DF2, DF2$Cell7 < up & DF2$Cell7 > low)
+Q <- quantile(DF$Cell2, probs=c(.25, .75), na.rm = FALSE)
+iqr <- IQR(DF$Cell2)
+up <- Q[2]+1.5*iqr # Upper Range
+low<- Q[1]-1.5*iqr # Lower Range
+Cell2_eliminated<- subset(DF2, DF2$Cell2 < up & DF2$Cell2 > low)
+#find overlapped index
+list.all <- list(Cell7_eliminated$index, Cell2_eliminated$index, Cell3_eliminated$index, Cell4_eliminated$index, Cell5_eliminated$index, Cell11_eliminated$index, Cell12_eliminated$index, Cell13_eliminated$index, Cell14_eliminated$index, Cell15_eliminated$index, Cell16_eliminated$index, Cell17_eliminated$index, Cell18_eliminated$index, Cell1_eliminated$index, Cell19_eliminated$index, Cell20_eliminated$index, Cell21_eliminated$index, Cell22_eliminated$index, Cell23_eliminated$index, Cell24_eliminated$index, Cell25_eliminated$index, Cell26_eliminated$index, Cell27_eliminated$index, Cell28_eliminated$index, Cell29_eliminated$index, Cell30_eliminated$index)
+overlaps<-data.matrix(Reduce(intersect, list.all))
+DF3<-DF2[is.element(DF2$index, overlaps),]
+#rename columns
+#drops included columns to be excluded
+drops <- c("Start","End","Nfrac","Chromosome","Cell9","Cell6","Gfrac","Cell8","Cell10")
+#update DF
+DF<-DF3[,1:33]
+DF<-DF[ , !(names(DF) %in% drops)]
+library("data.table")
+setnames(DF,old=c("Cell7"),new=c("Bulk"))
+setnames(DF,old=c("Cell1","Cell19","Cell20","Cell21","Cell22","Cell23","Cell24","Cell25","Cell26","Cell27","Cell28","Cell29","Cell30"),new=c("EOM1","EOM19","EOM20","EOM21","EOM22","EOM23","EOM24","EOM25","EOM26","EOM27","EOM28","EOM29","EOM30"))
+setnames(DF,old=c("Cell4","Cell5","Cell11","Cell12","Cell13","Cell14","Cell15","Cell16","Cell17","Cell18"),new=c("LOM4","LOM5","LOM11","LOM12","LOM13","LOM14","LOM15","LOM16","LOM17","LOM18"))
+setnames(DF,old=c("Cell2","Cell3"),new=c("LNM2","ENM3"))
+#normalize reads
+#library(clusterSim)
+#n9 - quotient transformation (x/mean)
+DF_normalized<-data.Normalization(DF,type="n9",normalization="column")
+#or 
+DF_normalized<-t(t(DF)/colMeans(DF))
+
+#R scripts
+##visualize Spearman correlations, histograms and pairwise scatterplots of normalized read abundance using “pairs.panels” in the “psych” R package
+#correlation plot of specific samples (select sample by column number)
+library(psych)
+chart.Correlation(DF_normalized[,c(26, 23, 21, 12,8)],hist=T,method="spearman",pch=".")
+pairs.panels(DF_normalized[,c(26, 23, 21, 12,25)], stars = TRUE,method="spearman",cex.axis = 2)
+
+#R scripts
+#calculate the correlation coefficient using the R package “Hmisc” version 4.3-0
+library("Hmisc")
+DF2<-cbind(DF$LOM4,DF$LOM5,DF$LOM11,DF$LOM12,DF$LOM13,DF$LOM14,DF$LOM15,DF$LOM16,DF$LOM17,DF$LOM18,DF$EOM1,DF$EOM19,DF$EOM20,DF$EOM21,DF$EOM22,DF$EOM23,DF$EOM24,DF$EOM25,DF$EOM26,DF$EOM27,DF$EOM28,DF$EOM29,DF$EOM30,DF$LNM2,DF$ENM3,DF$Bulk)
+res <- rcorr(as.matrix(DF2),type = "spearman")
+res$r
+res$P
+write.table(res$r, “/path/spearman-correlation", row.names=T, col.names=T,quote=F)
+
+#R scripts
+##constructed heatmaps and hierarchical clustering of Spearman correlation coefficient with the “gplots” R package version 3.0.1.1
+library("RColorBrewer")
+sampleDists<-as.dist(cor(DF, method="spearman",use = "everything"))
+sampleDists<-as.matrix(sampleDists)
+#reverse correlation value for better coloring
+sampleDists1<- ifelse(sampleDists==0,1,sampleDists)
+library("gplots")
+dev.off()
+heatmap.2(sampleDists,density.info="none",trace="none",dendrogram=c("row"),col=colorRampPalette(brewer.pal(9, "Greens")),scale = "none",symbreaks = FALSE,reorderfun=function(d, w) reorder(d, w, agglo.FUN = mean),cexRow=1.25,cexCol = 1.25)
+heatmap.2(sampleDists1,density.info="none",trace="none",dendrogram=c("row"),col=colorRampPalette(brewer.pal(9, "Greens")),scale = "none",symbreaks = FALSE,reorderfun=function(d, w) reorder(d, w, agglo.FUN = mean),cexRow=1.25,cexCol = 1.25,margins=c(5,10))
+stats{reorder.dendrogram}
+
+
+#CNV analysis
+##limite analysis to core genome, exclude the telomeric, sub-telomeric regions and hypervariable var gene clusters
+##read depth: We counted the reads in 1kb, 5kb, 8kb, 10kb bins by Bedtools and used Ginkgo to normalize (by dividing the count in each bin by the mean read, correct the bin read counts for GC bias, independently segment (using a minimum of 5 bins for each segment), and determine the copy number state in each sample with a predefined ploidy of 1
+##split/discordant reads: LUMPY in Speedseq to detect CNVs with at least two supporting reads in each sample
+##overlap CNV from two methods:identified shared CNVs from the two methods when one CNV overlapped with at least 50% of the other CNV and vice versa (50% reciprocal overlap).
+
+#Ginkgo: based on read depth
+#follow https://github.com/robertaboukhalil/ginkgo
+
+#LUMPY: based on discordant/split reads
+#call variants, -g genotype break ends with SVtyper, -d =read depth with CNVnator (not applicable here), -t = number of threads, -R = reference, -o = output prefix, -B = normal bam file, -D = discordant bam file, -S = split read bam, optionally use -m to specify minimum support (PE/SR) (depends on read depth)
+#following bam files are obtained from speedseq alignment
+sample_name_3D7_align.bam
+sample_name_3D7_aligned.discordants.bam
+sample_name_3D7_aligned.splitters.bam
+#use the following command to call structure variations
+speedseq sv -g -t 16 -R PlasmoDB-42_Pfalciparum3D7_Genome.fasta -o /path/sample_name_sv/ -B sample_name_3D7_align.sorted.bam -D sample_name_3D7_align.discordants.sorted.bam -S sample_name_3D7_align.splitters.sorted.bam
+
+#filter VCF file by core genome by Bedtools
+intersectBed -a input.vcf -b /path/to/core_genome.bed -header > output.vcf
+
+#Find overlap between Ginkgo and LUMPY using Bedtools
+#-f overlap in a at least 50%, -r reciprocal
+bedtools intersect -a Lumpy.vcf -b Ginkgo.txt -u -f 0.5 -r > Lumpy_ginkgo_overlap.txt
+
+
+#SNP analysis 
+#recalibrated base quality scores: base quality score recalibration was applied using default parameters, and using the PASS variants from the Pf crosses 1.0 release as a set of known sites
+gatk BaseRecalibrator -I sample_name_3D7_align.bam -R PlasmoDB-42_Pfalciparum3D7_Genome.fasta --known-sites ./pfcrossrelease/hb3_dd2.combined.final.vcf --known-sites ./pfcrossrelease/3d7_hb3.combined.final.vcf --known-sites ./pfcrossrelease/7g8_gb4.combined.final.vcf -O sample_name_recal_data.table
+
+gatk ApplyBQSR -R PlasmoDB-42_Pfalciparum3D7_Genome.fasta  -I sample_name_3D7_align.bam --bqsr-recal-file sample_name_recal_data.table -O sample_name_3D7_align.bqsr.bam
+
+#HaplotypeCaller: call snp and indels
+gatk --java-options "-Xmx6g" HaplotypeCaller -R PlasmoDB-42_Pfalciparum3D7_Genome.fasta -I sample_name_3D7_align.bqsr.bam -O sample_name_gatk.vcf.gz -ERC GVCF
+
+#Combine and genotype gvcf of all samples
+gatk CombineGVCFs  -R PlasmoDB-42_Pfalciparum3D7_Genome.fasta --variant sample_name_gatk.vcf.gz --variant sample_name_gatk.vcf.gz --variant sample_name_gatk.vcf.gz -O cohort.g.vcf.gz
+
+gatk --java-options "-Xmx6g" GenotypeGVCFs -R PlasmoDB-42_Pfalciparum3D7_Genome.fasta -V cohort.g.vcf.gz -O cohort_genotyped.g.vcf.gz
+
+#Recalibrating SNPs
+gatk VariantRecalibrator -R PlasmoDB-42_Pfalciparum3D7_Genome.fasta -V cohort_genotyped.g.vcf.gz --resource:hb3_dd2,known=false,training=true,truth=true,prior=15.0 ./pfcrossrelease/hb3_dd2.combined.final.vcf --resource:3d7_hb3,known=false,training=true,truth=true,prior=15.0 ./pfcrossrelease/3d7_hb3.combined.final.vcf --resource:7g8_gb4,known=false,training=true,truth=true,prior=15.0 ./pfcrossrelease/7g8_gb4.combined.final.vcf -an QD -an FS -an SOR -an DP -mode SNP -O cohort_output.recal --tranches-file cohort_output.tranches --rscript-file cohort_output.plots.R -mq-cap 70
+
+#Applying recalibration/filtering to SNPs
+gatk ApplyVQSR \
+   -R PlasmoDB-42_Pfalciparum3D7_Genome.fasta \
+   -V cohort_genotyped.g.vcf.gz  \
+   -O cohort_genotyped_applyvqsr.g.vcf.gz \
+   --truth-sensitivity-filter-level 99.0 \
+   --tranches-file cohort_output.tranches \
+   --recal-file cohort_output.recal \
+   -mode SNP
+
+#select only SNPs and BIALLELIC allele
+gatk SelectVariants \
+    -V cohort_genotyped_applyvqsr.g.vcf \
+    -select-type SNP \
+    -restrict-alleles-to BIALLELIC \
+    -O cohort_genotyped_applyvqsr_snp_biallelic.g.vcf.gz
+
+#filter by VQSLOD <6
+gatk VariantFiltration \
+    -V cohort_genotyped_applyvqsr_snp_biallelic.g.vcf \
+    -filter "VQSLOD < 6.0" --filter-name "VQSLOD6" \
+    -O cohort_genotyped_applyvqsr_snp_biallelic.g.vqslod6.vcf
+
+gatk SelectVariants \
+     -R PlasmoDB-42_Pfalciparum3D7_Genome.fasta \
+     -V cohort_genotyped_applyvqsr_snp_biallelic.g.vqslod6.vcf \
+     -O cohort_genotyped_applyvqsr_snp_biallelic.g.vqslod6selected.vcf \
+--exclude-filtered
+
+
+#filter by core genome
+gatk IndexFeatureFile -I cohort_genotyped_applyvqsr_snp_biallelic.g.vcf
+gatk SelectVariants  -R PlasmoDB-42_Pfalciparum3D7_Genome.fasta -V  cohort_genotyped_applyvqsr_snp_biallelic.g.vcf  -O cohort_genotyped_applyvqsr_snp_biallelic.g.core.vcf -L core_genome.bed
+
+#Annotation using snpEff
+java -Xmx4G -jar snpEff.jar build -gff3 -v PF3D7
+java -Xmx4G -jar snpEff.jar PF3D7 cohort_genotyped_applyvqsr_snp_biallelic.g.vcf > cohort_genotyped_applyvqsr_snp_biallelic.g.snpEFF.vcf
+
+#VCF visualization with VIVA
+viva -f cohort_genotyped_applyvqsr_snp_biallelic.g.snpEFF.vcf -o /output_path/
+
+
